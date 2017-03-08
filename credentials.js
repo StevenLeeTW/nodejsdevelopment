@@ -1,9 +1,9 @@
 module.exports = {
 	mongo: {    
 			development: {        
-			connectionString: 'MongoDBURL',},
+			connectionString: 'mongodb://jirlu:s223569@ds063140.mlab.com:63140/ddatebase',},
 			production: {        
-			connectionString: 'MongoDBURL',},
+			connectionString: 'mongodb://jirlu:s223569@ds063140.mlab.com:63140/ddatebase',},
 			    	     }, 	
 	cookieSecret: 'you cookie secret goes here',
 	gmail: {
