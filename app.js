@@ -1,15 +1,24 @@
-var https = require('https'),
+var http = require('http'),
+    https = require('https'),
     express = require('express'),
     fortune = require('./lib/fortune.js'),
     formidable = require('formidable'),
     fs = require('fs'),
     vhost = require('vhost'),
+    Q = require('q'),
+    Dealer = require('./models/dealer.js'),
     Vacation = require('./models/vacation.js'),
     VacationInSeasonListener = require('./models/vacationInSeasonListener.js');
 
 var app = express();
 
 var credentials = require('./credentials.js');
+
+// twitter library
+var twitter = require('./lib/twitter')({
+    consumerKey: credentials.twitter.consumerKey,
+    consumerSecret: credentials.twitter.consumerSecret,
+});
 
 var emailService = require('./lib/email.js')(credentials);
 
@@ -183,6 +192,157 @@ Vacation.find(function(err, vacations){
     }).save();
 });
 
+// initialize dealers
+Dealer.find({}, function(err, dealers){
+    if(dealers.length) return;
+    
+    new Dealer({
+        name: 'Oregon Novelties',
+        address1: '912 NW Davis St',
+        city: 'Portland',
+        state: 'OR',
+        zip: '97209',
+        country: 'US',
+        phone: '503-555-1212',
+        active: true,
+    }).save();
+
+    new Dealer({
+        name: 'Bruce\'s Bric-a-Brac',
+        address1: '159 Beeswax Ln',
+        city: 'Manzanita',
+        state: 'OR',
+        zip: '97209',
+        country: 'US',
+        phone: '503-555-1212',
+        active: true,
+    }).save();
+
+    new Dealer({
+        name: 'Aunt Beru\'s Oregon Souveniers',
+        address1: '544 NE Emerson Ave',
+        city: 'Bend',
+        state: 'OR',
+        zip: '97701',
+        country: 'US',
+        phone: '503-555-1212',
+        active: true,
+    }).save();
+
+    new Dealer({
+        name: 'Oregon Goodies',
+        address1: '1353 NW Beca Ave',
+        city: 'Corvallis',
+        state: 'OR',
+        zip: '97330',
+        country: 'US',
+        phone: '503-555-1212',
+        active: true,
+    }).save();
+
+    new Dealer({
+        name: 'Oregon Grab-n-Fly',
+        address1: '7000 NE Airport Way',
+        city: 'Portland',
+        state: 'OR',
+        zip: '97219',
+        country: 'US',
+        phone: '503-555-1212',
+        active: true,
+    }).save();
+});
+
+// dealer geocoding
+function geocodeDealer(dealer){
+    var addr = dealer.getAddress(' ');
+    if(addr===dealer.geocodedAddress) return;   // already geocoded
+
+    if(dealerCache.geocodeCount >= dealerCache.geocodeLimit){
+        // has 24 hours passed since we last started geocoding?
+        if(Date.now() > dealerCache.geocodeCount + 24 * 60 * 60 * 1000){
+            dealerCache.geocodeBegin = Date.now();
+            dealerCache.geocodeCount = 0;
+        } else {
+            // we can't geocode this now: we've
+            // reached our usage limit
+            return;
+        }
+    }
+
+    var geocode = require('./lib/geocode.js');
+    geocode(addr, function(err, coords){
+        if(err) return console.log('Geocoding failure for ' + addr);
+        dealer.lat = coords.lat;
+        dealer.lng = coords.lng;
+        dealer.save();
+    });
+}
+
+// optimize performance of dealer display
+function dealersToGoogleMaps(dealers){
+    var js = 'function addMarkers(map){\n' +
+        'var markers = [];\n' +
+        'var Marker = google.maps.Marker;\n' +
+        'var LatLng = google.maps.LatLng;\n';
+    dealers.forEach(function(d){
+        var name = d.name.replace(/'/, '\\\'')
+            .replace(/\\/, '\\\\');
+        js += 'markers.push(new Marker({\n' +
+                '\tposition: new LatLng(' +
+                    d.lat + ', ' + d.lng + '),\n' +
+                '\tmap: map,\n' +
+                '\ttitle: \'' + name.replace(/'/, '\\') + '\',\n' +
+            '}));\n';
+    });
+    js += '}';
+    return js;
+}
+
+// dealer cache
+var dealerCache = {
+    lastRefreshed: 0,
+    refreshInterval: 60 * 60 * 1000,
+    jsonUrl: '/dealers.json',
+    geocodeLimit: 2000,
+    geocodeCount: 0,
+    geocodeBegin: 0,
+};
+dealerCache.jsonFile = __dirname +
+    '/public' + dealerCache.jsonUrl;
+dealerCache.refresh = function(cb){
+
+    if(Date.now() > dealerCache.lastRefreshed + dealerCache.refreshInterval){
+        // we need to refresh the cache
+        Dealer.find({ active: true }, function(err, dealers){
+            if(err) return console.log('Error fetching dealers: '+
+                 err);
+
+            // geocodeDealer will do nothing if coordinates are up-to-date
+            dealers.forEach(geocodeDealer);
+
+            // we now write all the dealers out to our cached JSON file
+            fs.writeFileSync(dealerCache.jsonFile, JSON.stringify(dealers));
+
+            fs.writeFileSync(__dirname + '/public/js/dealers-googleMapMarkers.js', dealersToGoogleMaps(dealers));
+
+            // all done -- invoke callback
+            cb();
+        });
+    }
+
+};
+function refreshDealerCacheForever(){
+    dealerCache.refresh(function(){
+        // call self after refresh interval
+        setTimeout(refreshDealerCacheForever,
+            dealerCache.refreshInterval);
+    });
+}
+// create empty cache if it doesn't exist to prevent 404 errors
+if(!fs.existsSync(dealerCache.jsonFile)) fs.writeFileSync(JSON.stringify([]));
+// start refreshing cache
+refreshDealerCacheForever();
+
 // flash message middleware
 app.use(function(req, res, next){        
 // if there's a flash message, transfer it to the context, then clear it   
@@ -197,37 +357,101 @@ app.use(function(req, res, next) { // it must appear before we define any routes
     next();
 });
 
-function getWeatherData(){
-    return {
+
+// mocked weather data
+var getWeatherData = (function(){
+    // our weather cache
+    var c = {
+        refreshed: 0,
+        refreshing: false,
+        updateFrequency: 360000, // 1 hour
         locations: [
-            {
-                name: 'Portland',
-                forecastUrl: 'http://www.wunderground.com/US/OR/Portland.html',
-                iconUrl: 'http://icons-ak.wxug.com/i/c/k/cloudy.gif',
-                weather: 'Overcast',
-                temp: '54.1 F (12.3 C)',
-            },
-            {
-                name: 'Bend',
-                forecastUrl: 'http://www.wunderground.com/US/OR/Bend.html',
-                iconUrl: 'http://icons-ak.wxug.com/i/c/k/partlycloudy.gif',
-                weather: 'Partly Cloudy',
-                temp: '55.0 F (12.8 C)',
-            },
-            {
-                name: 'Manzanita',
-                forecastUrl: 'http://www.wunderground.com/US/OR/Manzanita.html',
-                iconUrl: 'http://icons-ak.wxug.com/i/c/k/rain.gif',
-                weather: 'Light Rain',
-                temp: '55.0 F (12.8 C)',
-            },
-        ],
+            { name: 'Portland' },
+            { name: 'Bend' },
+            { name: 'Manzanita' },
+        ]
     };
-}
+    return function() {
+        if( !c.refreshing && Date.now() > c.refreshed + c.updateFrequency ){
+            c.refreshing = true;
+            var promises = c.locations.map(function(loc){
+                return Q.Promise(function(resolve){
+                    var url = 'http://api.wunderground.com/api/' +
+                        credentials.WeatherUnderground.ApiKey +
+                        '/conditions/q/OR/' + loc.name + '.json';
+                    http.get(url, function(res){
+                        var body = '';
+                        res.on('data', function(chunk){
+                            body += chunk;
+                        });
+                        res.on('end', function(){
+                            body = JSON.parse(body);
+                            loc.forecastUrl = body.current_observation.forecast_url;
+                            loc.iconUrl = body.current_observation.icon_url;
+                            loc.weather = body.current_observation.weather;
+                            loc.temp = body.current_observation.temperature_string;
+                            resolve();
+                        });
+                    });
+                });
+            });
+            Q.all(promises).then(function(){
+                c.refreshing = false;
+                c.refreshed = Date.now();
+            });
+        }
+        return { locations: c.locations };
+    };
+})();
+// initialize weather cache
+getWeatherData();
+
+// middleware to add weather data to context
 app.use(function(req, res, next){
     if(!res.locals.partials) res.locals.partials = {};
     res.locals.partials.weatherContext = getWeatherData();
     next();
+});
+
+
+// twitter integration
+var topTweets = {
+    count: 10,
+    lastRefreshed: 0,
+    refreshInterval: 15 * 60 * 1000,
+    tweets: [],
+};
+function getTopTweets(cb){
+    if(Date.now() < topTweets.lastRefreshed + topTweets.refreshInterval) {
+        return setImmediate(function() {
+            cb(topTweets.tweets);
+        });
+    }
+
+    twitter.search('#travel', topTweets.count, function(result){
+        var formattedTweets = [];
+        var embedOpts = { omit_script: 1 };
+        var promises = result.statuses.map(function(status){
+            return Q.Promise(function(resolve){
+                twitter.embed(status.id_str, embedOpts, function(embed){
+                    formattedTweets.push(embed.html);
+                    resolve();
+                });
+            });
+        });
+        Q.all(promises).then(function(){
+            topTweets.lastRefreshed = Date.now();
+            cb(topTweets.tweets = formattedTweets);
+        });
+    });
+}
+
+// middleware to add top tweets to context
+app.use(function(req, res, next) {
+    getTopTweets(function(tweets) {
+        res.locals.topTweets = tweets;
+        next();
+    });
 });
 
 // middleware to handle logo image easter eggs
@@ -237,6 +461,13 @@ app.use(function(req, res, next){
     res.locals.logoImage = now.getMonth()==2 && now.getDate()==26 ?
     static('/img/logo_bud_clark.png') :
     static('/img/logo.png');
+    next();
+});
+
+// middleware to provide cart data for header
+app.use(function(req, res, next) {
+    var cart = req.session.cart;
+    res.locals.cartItems = cart && cart.items ? cart.items.length : 0;
     next();
 });
 
@@ -315,6 +546,23 @@ app.get('/attraction/:id', function(req, content, cb){
             location: a.location,
         });
     });
+});
+
+// API configuration
+var apiOptions = {
+    context: '/',
+    domain: require('domain').create(),
+};
+
+apiOptions.domain.on('error', function(err){
+    console.log('API domain error.\n', err.stack);
+    setTimeout(function(){
+        console.log('Server shutting down after API domain error.');
+        process.exit(1);
+    }, 5000);
+    server.close();
+    var worker = require('cluster').worker;
+    if(worker) worker.disconnect();
 });
 
 // authentication
